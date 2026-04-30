@@ -26,6 +26,9 @@ JWT_SECRET = os.environ["JWT_SECRET"]
 JWT_ALGORITHM = os.environ.get("JWT_ALGORITHM", "HS256")
 JWT_EXPIRE_MINUTES = int(os.environ.get("JWT_EXPIRE_MINUTES", "10080"))
 EMERGENT_LLM_KEY = os.environ.get("EMERGENT_LLM_KEY", "")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
+COHERE_API_KEY = os.environ.get("COHERE_API_KEY", "")
 WHATSAPP_ACCESS_TOKEN = os.environ.get("WHATSAPP_ACCESS_TOKEN", "")
 WHATSAPP_PHONE_NUMBER_ID = os.environ.get("WHATSAPP_PHONE_NUMBER_ID", "")
 WHATSAPP_API_VERSION = os.environ.get("WHATSAPP_API_VERSION", "v20.0")
@@ -350,8 +353,6 @@ async def create_impact(body: ImpactInput, user: dict = Depends(get_current_user
         "alerts_sent": False,
         "created_at": datetime.now(timezone.utc).isoformat()
     }
-    await db.impact_events.insert_one(impact_doc)
-
     # Get user profile for AI diagnosis
     profile = await db.user_profiles.find_one({"user_id": user["id"]}, {"_id": 0})
     settings = await db.user_settings.find_one({"user_id": user["id"]}, {"_id": 0})
@@ -361,13 +362,10 @@ async def create_impact(body: ImpactInput, user: dict = Depends(get_current_user
     diagnosis = None
     try:
         diagnosis = await generate_ai_diagnosis(impact_doc, profile)
-        await db.impact_events.update_one(
-            {"id": impact_id},
-            {"$set": {"ai_diagnosis": diagnosis}}
-        )
-        impact_doc["ai_diagnosis"] = diagnosis
     except Exception as e:
         logger.error(f"AI diagnosis failed: {e}")
+    impact_doc["ai_diagnosis"] = diagnosis or build_fallback_diagnosis(impact_doc, "No fue posible consultar proveedores IA")
+    await db.impact_events.insert_one(impact_doc)
 
     # Send alerts if above threshold
     if body.g_force >= threshold:
@@ -416,10 +414,7 @@ async def receive_telemetry(body: TelemetryInput, user: dict = Depends(get_curre
     await db.telemetry.insert_one(doc)
     return {"status": "ok", "g_force": body.g_force, "severity": classify_severity(body.g_force)}
 
-# ─── AI Diagnosis (Gemini 2.5 Flash) ───
-
-async def generate_ai_diagnosis(impact: dict, profile: dict | None) -> dict:
-    from emergentintegrations.llm.chat import LlmChat, UserMessage
+def build_diagnosis_prompt(impact: dict, profile: dict | None) -> tuple[str, str]:
 
     profile_info = ""
     if profile:
@@ -453,31 +448,89 @@ async def generate_ai_diagnosis(impact: dict, profile: dict | None) -> dict:
         f"Genera el diagnóstico de emergencia en JSON."
     )
 
-    chat = LlmChat(
-        api_key=EMERGENT_LLM_KEY,
-        session_id=f"diagnosis-{impact.get('id', uuid.uuid4())}",
-        system_message=system_msg
-    ).with_model("gemini", "gemini-2.5-flash")
+    return system_msg, prompt
 
-    response = await chat.send_message(UserMessage(text=prompt))
+def parse_diagnosis_response(response: str) -> dict:
+    cleaned = response.strip()
+    if cleaned.startswith("```"):
+        cleaned = cleaned.split("\n", 1)[1] if "\n" in cleaned else cleaned[3:]
+        if cleaned.endswith("```"):
+            cleaned = cleaned[:-3]
+        cleaned = cleaned.strip()
+    return json.loads(cleaned)
 
-    try:
-        cleaned = response.strip()
-        if cleaned.startswith("```"):
-            cleaned = cleaned.split("\n", 1)[1] if "\n" in cleaned else cleaned[3:]
-            if cleaned.endswith("```"):
-                cleaned = cleaned[:-3]
-            cleaned = cleaned.strip()
-        return json.loads(cleaned)
-    except json.JSONDecodeError:
-        return {
-            "severity_assessment": f"Impacto de {impact.get('g_force', 0):.1f}G clasificado como {impact.get('severity_label', 'N/A')}",
-            "possible_injuries": ["Evaluación no disponible - consulte a un profesional médico"],
-            "first_aid_steps": ["Llamar a servicios de emergencia", "No mover al paciente", "Mantener vías aéreas despejadas"],
-            "emergency_recommendations": ["Activar servicios de emergencia 911"],
-            "priority_level": impact.get("severity", "medio"),
-            "raw_response": response
-        }
+def build_fallback_diagnosis(impact: dict, raw_response: str = "") -> dict:
+    return {
+        "severity_assessment": f"Impacto de {impact.get('g_force', 0):.1f}G clasificado como {impact.get('severity_label', 'N/A')}",
+        "possible_injuries": ["Evaluación no disponible - consulte a un profesional médico"],
+        "first_aid_steps": ["Llamar a servicios de emergencia", "No mover al paciente", "Mantener vías aéreas despejadas"],
+        "emergency_recommendations": ["Activar servicios de emergencia 911"],
+        "priority_level": impact.get("severity", "medio"),
+        "raw_response": raw_response
+    }
+
+async def call_gemini_diagnosis(system_msg: str, prompt: str) -> dict:
+    if not GEMINI_API_KEY:
+        raise RuntimeError("GEMINI_API_KEY no configurada")
+    url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
+    params = {"key": GEMINI_API_KEY}
+    payload = {
+        "systemInstruction": {"parts": [{"text": system_msg}]},
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"temperature": 0.2}
+    }
+    async with httpx.AsyncClient(timeout=25) as http_client:
+        resp = await http_client.post(url, params=params, json=payload)
+        resp.raise_for_status()
+        data = resp.json()
+    text = data["candidates"][0]["content"]["parts"][0]["text"]
+    return parse_diagnosis_response(text)
+
+async def call_groq_diagnosis(system_msg: str, prompt: str) -> dict:
+    if not GROQ_API_KEY:
+        raise RuntimeError("GROQ_API_KEY no configurada")
+    url = "https://api.groq.com/openai/v1/chat/completions"
+    headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
+    payload = {
+        "model": "llama3-8b-8192",
+        "temperature": 0.2,
+        "messages": [{"role": "system", "content": system_msg}, {"role": "user", "content": prompt}]
+    }
+    async with httpx.AsyncClient(timeout=25) as http_client:
+        resp = await http_client.post(url, headers=headers, json=payload)
+        resp.raise_for_status()
+        data = resp.json()
+    return parse_diagnosis_response(data["choices"][0]["message"]["content"])
+
+async def call_cohere_diagnosis(system_msg: str, prompt: str) -> dict:
+    if not COHERE_API_KEY:
+        raise RuntimeError("COHERE_API_KEY no configurada")
+    url = "https://api.cohere.com/v2/chat"
+    headers = {"Authorization": f"Bearer {COHERE_API_KEY}", "Content-Type": "application/json"}
+    payload = {"model": "command-r", "temperature": 0.2, "preamble": system_msg, "message": prompt}
+    async with httpx.AsyncClient(timeout=25) as http_client:
+        resp = await http_client.post(url, headers=headers, json=payload)
+        resp.raise_for_status()
+        data = resp.json()
+    return parse_diagnosis_response(data["message"]["content"][0]["text"])
+
+async def generate_ai_diagnosis(impact: dict, profile: dict | None) -> dict:
+    system_msg, prompt = build_diagnosis_prompt(impact, profile)
+    providers = [
+        ("gemini-1.5-flash", call_gemini_diagnosis),
+        ("llama-3-8b (groq)", call_groq_diagnosis),
+        ("command-r (cohere)", call_cohere_diagnosis),
+    ]
+    errors = []
+    for provider_name, provider_call in providers:
+        try:
+            diagnosis = await provider_call(system_msg, prompt)
+            diagnosis["model_used"] = provider_name
+            return diagnosis
+        except Exception as e:
+            logger.warning(f"Diagnosis provider failed {provider_name}: {e}")
+            errors.append(f"{provider_name}: {e}")
+    return build_fallback_diagnosis(impact, " | ".join(errors))
 
 # ─── WhatsApp Service ───
 
