@@ -25,7 +25,10 @@ DB_NAME = os.environ["DB_NAME"]
 JWT_SECRET = os.environ["JWT_SECRET"]
 JWT_ALGORITHM = os.environ.get("JWT_ALGORITHM", "HS256")
 JWT_EXPIRE_MINUTES = int(os.environ.get("JWT_EXPIRE_MINUTES", "10080"))
-EMERGENT_LLM_KEY = os.environ.get("EMERGENT_LLM_KEY", "")
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
+COHERE_API_KEY = os.environ.get("COHERE_API_KEY", "")
+GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY", "")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-1.5-flash")
 WHATSAPP_ACCESS_TOKEN = os.environ.get("WHATSAPP_ACCESS_TOKEN", "")
 WHATSAPP_PHONE_NUMBER_ID = os.environ.get("WHATSAPP_PHONE_NUMBER_ID", "")
 WHATSAPP_API_VERSION = os.environ.get("WHATSAPP_API_VERSION", "v20.0")
@@ -416,11 +419,9 @@ async def receive_telemetry(body: TelemetryInput, user: dict = Depends(get_curre
     await db.telemetry.insert_one(doc)
     return {"status": "ok", "g_force": body.g_force, "severity": classify_severity(body.g_force)}
 
-# ─── AI Diagnosis (Gemini 2.5 Flash) ───
+# ─── AI Diagnosis (Groq + Cohere + Gemini) ───
 
-async def generate_ai_diagnosis(impact: dict, profile: dict | None) -> dict:
-    from emergentintegrations.llm.chat import LlmChat, UserMessage
-
+def build_diagnosis_prompt(impact: dict, profile: dict | None) -> tuple[str, str]:
     profile_info = ""
     if profile:
         profile_info = (
@@ -438,7 +439,7 @@ async def generate_ai_diagnosis(impact: dict, profile: dict | None) -> dict:
         "Responde SIEMPRE en formato JSON válido con las siguientes claves: "
         "severity_assessment (string), possible_injuries (array de strings), "
         "first_aid_steps (array de strings), emergency_recommendations (array de strings), "
-        "priority_level (string: bajo/medio/alto/crítico). "
+        "priority_level (string: bajo/medio/alto/crítico), summary_for_whatsapp (string corto y claro). "
         "No incluyas markdown, solo JSON puro."
     )
 
@@ -452,32 +453,90 @@ async def generate_ai_diagnosis(impact: dict, profile: dict | None) -> dict:
         f"PERFIL MÉDICO DEL USUARIO:\n{profile_info or 'No disponible'}\n\n"
         f"Genera el diagnóstico de emergencia en JSON."
     )
+    return system_msg, prompt
 
-    chat = LlmChat(
-        api_key=EMERGENT_LLM_KEY,
-        session_id=f"diagnosis-{impact.get('id', uuid.uuid4())}",
-        system_message=system_msg
-    ).with_model("gemini", "gemini-2.5-flash")
+def normalize_diagnosis(payload: dict, impact: dict, provider: str) -> dict:
+    fallback = {
+        "severity_assessment": f"Impacto de {impact.get('g_force', 0):.1f}G clasificado como {impact.get('severity_label', 'N/A')}",
+        "possible_injuries": ["Evaluación no disponible - consulte a un profesional médico"],
+        "first_aid_steps": ["Llamar a servicios de emergencia", "No mover al paciente", "Mantener vías aéreas despejadas"],
+        "emergency_recommendations": ["Activar servicios de emergencia 911"],
+        "priority_level": impact.get("severity", "medio"),
+        "summary_for_whatsapp": f"Impacto {impact.get('severity_label', 'N/A')} ({impact.get('g_force', 0):.1f}G). Se recomienda atención médica inmediata."
+    }
+    merged = {**fallback, **(payload or {})}
+    merged["provider"] = provider
+    return merged
 
-    response = await chat.send_message(UserMessage(text=prompt))
+async def _call_groq(system_msg: str, prompt: str) -> dict | None:
+    if not GROQ_API_KEY:
+        return None
+    url = "https://api.groq.com/openai/v1/chat/completions"
+    headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
+    payload = {
+        "model": "llama-3.1-70b-versatile",
+        "messages": [{"role": "system", "content": system_msg}, {"role": "user", "content": prompt}],
+        "temperature": 0.2,
+        "response_format": {"type": "json_object"}
+    }
+    async with httpx.AsyncClient(timeout=20.0) as client_http:
+        resp = await client_http.post(url, json=payload, headers=headers)
+        resp.raise_for_status()
+        data = resp.json()
+    return json.loads(data["choices"][0]["message"]["content"])
 
-    try:
-        cleaned = response.strip()
-        if cleaned.startswith("```"):
-            cleaned = cleaned.split("\n", 1)[1] if "\n" in cleaned else cleaned[3:]
-            if cleaned.endswith("```"):
-                cleaned = cleaned[:-3]
-            cleaned = cleaned.strip()
-        return json.loads(cleaned)
-    except json.JSONDecodeError:
-        return {
-            "severity_assessment": f"Impacto de {impact.get('g_force', 0):.1f}G clasificado como {impact.get('severity_label', 'N/A')}",
-            "possible_injuries": ["Evaluación no disponible - consulte a un profesional médico"],
-            "first_aid_steps": ["Llamar a servicios de emergencia", "No mover al paciente", "Mantener vías aéreas despejadas"],
-            "emergency_recommendations": ["Activar servicios de emergencia 911"],
-            "priority_level": impact.get("severity", "medio"),
-            "raw_response": response
-        }
+async def _call_cohere(system_msg: str, prompt: str) -> dict | None:
+    if not COHERE_API_KEY:
+        return None
+    url = "https://api.cohere.com/v2/chat"
+    headers = {"Authorization": f"Bearer {COHERE_API_KEY}", "Content-Type": "application/json"}
+    payload = {
+        "model": "command-r-plus",
+        "messages": [{"role": "system", "content": system_msg}, {"role": "user", "content": prompt}],
+        "temperature": 0.2,
+        "response_format": {"type": "json_object"}
+    }
+    async with httpx.AsyncClient(timeout=20.0) as client_http:
+        resp = await client_http.post(url, json=payload, headers=headers)
+        resp.raise_for_status()
+        data = resp.json()
+    text = data.get("message", {}).get("content", [{}])[0].get("text", "{}")
+    return json.loads(text)
+
+async def _call_gemini(system_msg: str, prompt: str) -> dict | None:
+    if not GOOGLE_API_KEY:
+        return None
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GOOGLE_API_KEY}"
+    payload = {
+        "system_instruction": {"parts": [{"text": system_msg}]},
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"temperature": 0.2, "responseMimeType": "application/json"}
+    }
+    async with httpx.AsyncClient(timeout=20.0) as client_http:
+        resp = await client_http.post(url, json=payload)
+        resp.raise_for_status()
+        data = resp.json()
+    text = data["candidates"][0]["content"]["parts"][0]["text"]
+    return json.loads(text)
+
+async def generate_ai_diagnosis(impact: dict, profile: dict | None) -> dict:
+    system_msg, prompt = build_diagnosis_prompt(impact, profile)
+    providers = [("groq", _call_groq), ("cohere", _call_cohere), ("gemini", _call_gemini)]
+    errors = []
+    for provider_name, caller in providers:
+        try:
+            result = await caller(system_msg, prompt)
+            if result:
+                diagnosis = normalize_diagnosis(result, impact, provider_name)
+                diagnosis["full_diagnosis"] = diagnosis.copy()
+                return diagnosis
+        except Exception as e:
+            errors.append(f"{provider_name}: {str(e)}")
+            logger.error(f"AI provider failed [{provider_name}]: {e}")
+    fallback = normalize_diagnosis({}, impact, "fallback")
+    fallback["error_details"] = errors
+    fallback["full_diagnosis"] = fallback.copy()
+    return fallback
 
 # ─── WhatsApp Service ───
 
@@ -515,9 +574,9 @@ async def send_emergency_alerts(user: dict, impact: dict, profile: dict | None, 
 
     diagnosis_str = ""
     if diagnosis:
+        diagnosis_summary = diagnosis.get("summary_for_whatsapp") or diagnosis.get("severity_assessment", "N/A")
         diagnosis_str = (
-            f"🏥 Diagnóstico IA:\n"
-            f"Severidad: {diagnosis.get('severity_assessment', 'N/A')}\n"
+            f"🏥 Diagnóstico IA (resumen): {diagnosis_summary}\n"
             f"Prioridad: {diagnosis.get('priority_level', 'N/A')}\n"
         )
 
