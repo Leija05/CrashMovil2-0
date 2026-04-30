@@ -26,6 +26,7 @@ JWT_SECRET = os.environ["JWT_SECRET"]
 JWT_ALGORITHM = os.environ.get("JWT_ALGORITHM", "HS256")
 JWT_EXPIRE_MINUTES = int(os.environ.get("JWT_EXPIRE_MINUTES", "10080"))
 EMERGENT_LLM_KEY = os.environ.get("EMERGENT_LLM_KEY", "")
+GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY", "")
 WHATSAPP_ACCESS_TOKEN = os.environ.get("WHATSAPP_ACCESS_TOKEN", "")
 WHATSAPP_PHONE_NUMBER_ID = os.environ.get("WHATSAPP_PHONE_NUMBER_ID", "")
 WHATSAPP_API_VERSION = os.environ.get("WHATSAPP_API_VERSION", "v20.0")
@@ -416,11 +417,33 @@ async def receive_telemetry(body: TelemetryInput, user: dict = Depends(get_curre
     await db.telemetry.insert_one(doc)
     return {"status": "ok", "g_force": body.g_force, "severity": classify_severity(body.g_force)}
 
-# ─── AI Diagnosis (Gemini 2.5 Flash) ───
+# ─── AI Diagnosis (Dual Provider Fallback) ───
 
-async def generate_ai_diagnosis(impact: dict, profile: dict | None) -> dict:
-    from emergentintegrations.llm.chat import LlmChat, UserMessage
+def _build_diagnosis_fallback(impact: dict, raw_response: str | None = None) -> dict:
+    return {
+        "severity_assessment": f"Impacto de {impact.get('g_force', 0):.1f}G clasificado como {impact.get('severity_label', 'N/A')}",
+        "possible_injuries": ["Evaluación no disponible - consulte a un profesional médico"],
+        "first_aid_steps": ["Llamar a servicios de emergencia", "No mover al paciente", "Mantener vías aéreas despejadas"],
+        "emergency_recommendations": ["Activar servicios de emergencia 911"],
+        "priority_level": impact.get("severity", "medio"),
+        **({"raw_response": raw_response} if raw_response else {}),
+    }
 
+
+def _parse_ai_json_response(response: str, impact: dict) -> dict:
+    try:
+        cleaned = response.strip()
+        if cleaned.startswith("```"):
+            cleaned = cleaned.split("\n", 1)[1] if "\n" in cleaned else cleaned[3:]
+            if cleaned.endswith("```"):
+                cleaned = cleaned[:-3]
+            cleaned = cleaned.strip()
+        return json.loads(cleaned)
+    except Exception:
+        return _build_diagnosis_fallback(impact, response)
+
+
+def _build_diagnosis_prompt(impact: dict, profile: dict | None) -> tuple[str, str]:
     profile_info = ""
     if profile:
         profile_info = (
@@ -452,6 +475,11 @@ async def generate_ai_diagnosis(impact: dict, profile: dict | None) -> dict:
         f"PERFIL MÉDICO DEL USUARIO:\n{profile_info or 'No disponible'}\n\n"
         f"Genera el diagnóstico de emergencia en JSON."
     )
+    return system_msg, prompt
+
+
+async def _diagnose_with_emergent(impact: dict, system_msg: str, prompt: str) -> dict:
+    from emergentintegrations.llm.chat import LlmChat, UserMessage
 
     chat = LlmChat(
         api_key=EMERGENT_LLM_KEY,
@@ -460,24 +488,42 @@ async def generate_ai_diagnosis(impact: dict, profile: dict | None) -> dict:
     ).with_model("gemini", "gemini-2.5-flash")
 
     response = await chat.send_message(UserMessage(text=prompt))
+    return _parse_ai_json_response(response, impact)
+
+
+def _diagnose_with_google_genai(impact: dict, system_msg: str, prompt: str) -> dict:
+    import google.generativeai as genai
+
+    genai.configure(api_key=GOOGLE_API_KEY)
+    model = genai.GenerativeModel(
+        model_name=os.environ.get("GEMINI_MODEL", "gemini-2.0-flash-lite"),
+        system_instruction=system_msg
+    )
+    response = model.generate_content(prompt)
+    return _parse_ai_json_response(response.text or "", impact)
+
+
+async def generate_ai_diagnosis(impact: dict, profile: dict | None) -> dict:
+    system_msg, prompt = _build_diagnosis_prompt(impact, profile)
+    errors: list[str] = []
 
     try:
-        cleaned = response.strip()
-        if cleaned.startswith("```"):
-            cleaned = cleaned.split("\n", 1)[1] if "\n" in cleaned else cleaned[3:]
-            if cleaned.endswith("```"):
-                cleaned = cleaned[:-3]
-            cleaned = cleaned.strip()
-        return json.loads(cleaned)
-    except json.JSONDecodeError:
-        return {
-            "severity_assessment": f"Impacto de {impact.get('g_force', 0):.1f}G clasificado como {impact.get('severity_label', 'N/A')}",
-            "possible_injuries": ["Evaluación no disponible - consulte a un profesional médico"],
-            "first_aid_steps": ["Llamar a servicios de emergencia", "No mover al paciente", "Mantener vías aéreas despejadas"],
-            "emergency_recommendations": ["Activar servicios de emergencia 911"],
-            "priority_level": impact.get("severity", "medio"),
-            "raw_response": response
-        }
+        if not EMERGENT_LLM_KEY:
+            raise RuntimeError("EMERGENT_LLM_KEY no configurada")
+        return await _diagnose_with_emergent(impact, system_msg, prompt)
+    except Exception as e:
+        logger.warning(f"Primary AI (emergentintegrations) failed: {e}")
+        errors.append(str(e))
+
+    try:
+        if not GOOGLE_API_KEY:
+            raise RuntimeError("GOOGLE_API_KEY no configurada")
+        return await __import__("asyncio").to_thread(_diagnose_with_google_genai, impact, system_msg, prompt)
+    except Exception as e:
+        logger.error(f"Fallback AI (google-generativeai) failed: {e}")
+        errors.append(str(e))
+
+    raise RuntimeError(f"Both AI providers failed. Last error: {errors[-1] if errors else 'unknown'}")
 
 # ─── WhatsApp Service ───
 
