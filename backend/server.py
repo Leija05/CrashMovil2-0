@@ -491,16 +491,25 @@ async def _diagnose_with_emergent(impact: dict, system_msg: str, prompt: str) ->
     return _parse_ai_json_response(response, impact)
 
 
-def _diagnose_with_google_genai(impact: dict, system_msg: str, prompt: str) -> dict:
-    import google.generativeai as genai
+async def _diagnose_with_google_rest(impact: dict, system_msg: str, prompt: str) -> dict:
+    model_name = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash-lite")
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={GOOGLE_API_KEY}"
+    payload = {
+        "system_instruction": {"parts": [{"text": system_msg}]},
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"temperature": 0.2}
+    }
+    async with httpx.AsyncClient(timeout=30) as client_http:
+        resp = await client_http.post(url, json=payload)
+        resp.raise_for_status()
+        data = resp.json()
 
-    genai.configure(api_key=GOOGLE_API_KEY)
-    model = genai.GenerativeModel(
-        model_name=os.environ.get("GEMINI_MODEL", "gemini-2.0-flash-lite"),
-        system_instruction=system_msg
-    )
-    response = model.generate_content(prompt)
-    return _parse_ai_json_response(response.text or "", impact)
+    text = ""
+    candidates = data.get("candidates", [])
+    if candidates:
+        parts = candidates[0].get("content", {}).get("parts", [])
+        text = "\n".join([p.get("text", "") for p in parts if p.get("text")])
+    return _parse_ai_json_response(text, impact)
 
 
 async def generate_ai_diagnosis(impact: dict, profile: dict | None) -> dict:
@@ -518,7 +527,7 @@ async def generate_ai_diagnosis(impact: dict, profile: dict | None) -> dict:
     try:
         if not GOOGLE_API_KEY:
             raise RuntimeError("GOOGLE_API_KEY no configurada")
-        return await __import__("asyncio").to_thread(_diagnose_with_google_genai, impact, system_msg, prompt)
+        return await _diagnose_with_google_rest(impact, system_msg, prompt)
     except Exception as e:
         logger.error(f"Fallback AI (google-generativeai) failed: {e}")
         errors.append(str(e))
@@ -582,6 +591,23 @@ async def send_emergency_alerts(user: dict, impact: dict, profile: dict | None, 
             logger.info(f"Alert sent to {contact['name']} ({contact['phone']})")
         except Exception as e:
             logger.error(f"Failed to alert {contact['name']}: {e}")
+
+
+# ─── WhatsApp Webhook ───
+
+@app.get("/webhook/whatsapp")
+async def whatsapp_webhook_verify(hub_mode: str | None = None, hub_verify_token: str | None = None, hub_challenge: str | None = None):
+    verify_token = os.environ.get("WHATSAPP_WEBHOOK_VERIFY_TOKEN", "")
+    if hub_mode == "subscribe" and hub_verify_token == verify_token:
+        return int(hub_challenge) if hub_challenge and hub_challenge.isdigit() else (hub_challenge or "ok")
+    raise HTTPException(status_code=403, detail="Webhook verification failed")
+
+
+@app.post("/webhook/whatsapp")
+async def whatsapp_webhook_receive(request: Request):
+    body = await request.json()
+    logger.info(f"WhatsApp webhook event received: {json.dumps(body)[:500]}")
+    return {"status": "received"}
 
 # ─── Health Check ───
 
